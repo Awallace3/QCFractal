@@ -24,7 +24,7 @@ try:
     import pandas as pd
     import psi4
 except ImportError:
-    raise ImportError("Please install pandas and psi4 to use this module")
+    raise ImportError("Please install pandas and psi4>=1.11 to use this module")
 
 if TYPE_CHECKING:
     from qcportal import PortalClient
@@ -39,11 +39,11 @@ FISAPT0_OPTIONS = {
     "scf_type": "df",
     "guess": "sad",
     "freeze_core": "true",
-    "FISAPT_FSAPT_FILEPATH": "fsapt",
+    "FISAPT_FSAPT_FILEPATH": "none",
 }
 
 
-def default_fisapt0_specification(
+def default_recommended_fisapt0_specification(
     *,
     basis: str = "jun-cc-pvdz",
     keywords: Optional[Dict[str, Any]] = None,
@@ -128,7 +128,7 @@ def create_dataset(
     df = load_fsapt_fragment_data(fragment_data)
 
     if qc_specification is None:
-        qc_specification = default_fisapt0_specification()
+        qc_specification = default_recommended_fisapt0_specification()
 
     ds = client.add_dataset("singlepoint", dataset_name)
 
@@ -222,8 +222,31 @@ def _scale_optional_energy(value: Optional[float]) -> Optional[float]:
     return value * HARTREE_TO_KCALMOL
 
 
+def _sum_optional_energies(*values: Optional[float]) -> Optional[float]:
+    valid_values = [v for v in values if v is not None]
+    if not valid_values:
+        return None
+    return sum(valid_values)
+
+
+def _extract_qcvars(atomic_result) -> Dict[str, Any]:
+    extras = atomic_result.extras or {}
+
+    if "extra_properties" in extras:
+        return dict(extras["extra_properties"])
+
+    if "qcvars" in extras:
+        return {str(k).lower(): v for k, v in extras["qcvars"].items()}
+
+    return {}
+
+
 def _all_fragment_row(
-    entry_name: str, mol: Any, atomic_result, qcvars: Dict[str, Any]
+    entry_name: str,
+    mol: Any,
+    qcvars: Dict[str, Any],
+    *,
+    record_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     _require_two_fragments(mol, entry_name)
 
@@ -253,7 +276,7 @@ def _all_fragment_row(
         "F-Dispersion": _scale_optional_energy(qcvars.get("sapt disp energy")),
         "F-Total": _scale_optional_energy(qcvars.get("sapt total energy")),
         "analysis_type": "all",
-        "record_id": atomic_result.extras.get("qcfractal_record_id"),
+        "record_id": record_id,
     }
 
 
@@ -268,8 +291,14 @@ def _fragment_results(
 ) -> List[Dict[str, Any]]:
     fragment_rows = []
 
+    use_global_indices = any(
+        any(int(idx) > len_monomer_a for idx in indices)
+        for indices in fragments_b.values()
+    )
     fragments_b_shifted = {
-        name: [int(idx) + len_monomer_a for idx in indices]
+        name: [int(idx) for idx in indices]
+        if use_global_indices
+        else [int(idx) + len_monomer_a for idx in indices]
         for name, indices in fragments_b.items()
     }
 
@@ -298,8 +327,11 @@ def _fragment_results(
                         "Frag2_indices": row["Frag2_indices"],
                         "F-Electrostatics": row.get("Elst"),
                         "F-Exchange": row.get("Exch"),
-                        "F-Induction": row.get("IndAB"),
-                        "F-Dispersion": row.get("EDisp", row.get("Disp")),
+                        "F-Induction": _sum_optional_energies(
+                            row.get("IndAB"),
+                            row.get("IndBA"),
+                        ),
+                        "F-Dispersion": row.get("Disp", row.get("EDisp")),
                         "F-Total": row.get("Total"),
                     }
                 )
@@ -343,16 +375,14 @@ def _analyze_datasets(
                     f"Record {rec.id} for entry {entry_name} is missing molecule data"
                 )
 
-            atomic_result.extras = dict(atomic_result.extras)
-            atomic_result.extras["qcfractal_record_id"] = rec.id
-            qcvars = atomic_result.extras.get("extra_properties", {})
+            qcvars = _extract_qcvars(atomic_result)
 
             if not qcvars:
                 raise RuntimeError(
                     f"Record {rec.id} for entry {entry_name} does not contain Psi4 extra_properties"
                 )
 
-            all_row = _all_fragment_row(entry_name, mol, atomic_result, qcvars)
+            all_row = _all_fragment_row(entry_name, mol, qcvars, record_id=rec.id)
             all_row["dataset_name"] = ds.name
             results.append(all_row)
 
