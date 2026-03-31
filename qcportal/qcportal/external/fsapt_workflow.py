@@ -258,10 +258,10 @@ def _all_fragment_row(
         "qcel_molecule": mol,
         "Frag1": "All",
         "Frag2": "All",
-        "Frag1_indices": [list(range(1, len_monomer_a + 1))],
-        "Frag2_indices": [
-            list(range(len_monomer_a + 1, len_monomer_a + len_monomer_b + 1))
-        ],
+        "Frag1_indices": list(range(1, len_monomer_a + 1)),
+        "Frag2_indices": list(
+            range(len_monomer_a + 1, len_monomer_a + len_monomer_b + 1)
+        ),
         "F-Electrostatics": _scale_optional_energy(qcvars.get("sapt elst energy")),
         "F-Exchange": _scale_optional_energy(qcvars.get("sapt exch energy")),
         "F-Induction": _scale_optional_energy(qcvars.get("sapt ind energy")),
