@@ -1,12 +1,18 @@
 from __future__ import annotations
+from qcportal.singlepoint.record_models import SinglepointRecord
+from qcportal.record_models import RecordStatusEnum
+from qcportal.external import fsapt_workflow
+from qcfractalcompute.compress import compress_result
 
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict
+from typing import Dict
+from qcarchivetesting.testing_classes import QCATestingSnowflake
 
 import pandas as pd
 import pytest
 from qcelemental.models import Molecule
+from pprint import pprint as pp
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _LOCAL_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -18,19 +24,49 @@ sys.path = [
 ]
 sys.path.insert(0, str(_REPO_ROOT))
 
-from qcfractalcompute.compress import compress_result
-from qcportal.external import fsapt_workflow
-from qcportal.record_models import RecordStatusEnum
-from qcportal.singlepoint.record_models import SinglepointRecord
-
-if TYPE_CHECKING:
-    from qcarchivetesting.testing_classes import QCATestingSnowflake
-
 
 psi4 = pytest.importorskip("psi4")
 
 
 FSAPT_CASES = [
+    {
+        "name": "methane_dimer",
+        "molecule": """0 1
+C 0.00000000 0.00000000 0.00000000
+H 1.09000000 0.00000000 0.00000000
+H -0.36333333 0.83908239 0.59332085
+H -0.36333333 0.09428973 -1.02332709
+H -0.36333333 -0.93337212 0.43000624
+--
+0 1
+C 6.44536662 -0.26509169 -0.00000000
+H 7.53536662 -0.26509169 -0.00000000
+H 6.08203329 0.57399070 0.59332085
+H 6.08203329 -0.17080196 -1.02332709
+H 6.08203329 -1.19846381 0.43000624
+symmetry c1
+no_reorient
+no_com""",
+        "basis": "jun-cc-pvdz",
+        "fragments_a": {"MethylA": [1, 2, 3, 4, 5]},
+        "fragments_b": {"MethylB": [6, 7, 8, 9, 10]},
+        "expected": {
+            ("MethylA", "MethylB"): {
+                "F-Electrostatics": -0.0023867836548276955,
+                "F-Exchange": 0.00011242419533877543,
+                "F-Induction": -2.4039823642064496e-05,
+                "F-Dispersion": -0.020636082319331096,
+                "F-Total": -0.02293448160273215,
+            },
+            ("All", "All"): {
+                "F-Electrostatics": -0.0023867836548276955,
+                "F-Exchange": 0.00011242419533877543,
+                "F-Induction": -2.4039823642064496e-05,
+                "F-Dispersion": -0.020636082319331096,
+                "F-Total": -0.02293448160273215,
+            },
+        },
+    },
     {
         "name": "multi_fragment_ethane_peptide",
         "molecule": """
@@ -116,44 +152,6 @@ no_com
             },
         },
     },
-    {
-        "name": "methane_dimer",
-        "molecule": """0 1
-C 0.00000000 0.00000000 0.00000000
-H 1.09000000 0.00000000 0.00000000
-H -0.36333333 0.83908239 0.59332085
-H -0.36333333 0.09428973 -1.02332709
-H -0.36333333 -0.93337212 0.43000624
---
-0 1
-C 6.44536662 -0.26509169 -0.00000000
-H 7.53536662 -0.26509169 -0.00000000
-H 6.08203329 0.57399070 0.59332085
-H 6.08203329 -0.17080196 -1.02332709
-H 6.08203329 -1.19846381 0.43000624
-symmetry c1
-no_reorient
-no_com""",
-        "basis": "jun-cc-pvdz",
-        "fragments_a": {"MethylA": [1, 2, 3, 4, 5]},
-        "fragments_b": {"MethylB": [6, 7, 8, 9, 10]},
-        "expected": {
-            ("MethylA", "MethylB"): {
-                "F-Electrostatics": -0.0023867836548276955,
-                "F-Exchange": 0.00011242419533877543,
-                "F-Induction": -2.4039823642064496e-05,
-                "F-Dispersion": -0.020636082319331096,
-                "F-Total": -0.02293448160273215,
-            },
-            ("All", "All"): {
-                "F-Electrostatics": -0.0023867836548276955,
-                "F-Exchange": 0.00011242419533877543,
-                "F-Induction": -2.4039823642064496e-05,
-                "F-Dispersion": -0.020636082319331096,
-                "F-Total": -0.02293448160273215,
-            },
-        },
-    },
 ]
 
 
@@ -207,6 +205,16 @@ def _lookup_pair(results: pd.DataFrame, frag1: str, frag2: str) -> pd.Series:
 def test_fsapt_workflow_dataset_matches_psi4_reference(
     snowflake: "QCATestingSnowflake", case, monkeypatch: pytest.MonkeyPatch
 ):
+    print(f"\n=== Running FSAPT workflow test for case: {case['name']} ===")
+    pp(
+        {
+            "basis": case["basis"],
+            "fragments_a": case["fragments_a"],
+            "fragments_b": case["fragments_b"],
+            "expected_pairs": list(case["expected"].keys()),
+        }
+    )
+
     snowflake_client = snowflake.client()
 
     fragment_df = pd.DataFrame(
@@ -224,7 +232,7 @@ def test_fsapt_workflow_dataset_matches_psi4_reference(
     dataset_name = f"FSAPT workflow {case['name']}"
     qc_spec = fsapt_workflow.default_recommended_fisapt0_specification(
         basis=case["basis"],
-        keywords={"FISAPT_FSAPT_FILEPATH": "none"}, # Can update options here
+        keywords={"FISAPT_FSAPT_FILEPATH": "none"},  # Can update options here
         keep_native_files=False,
     )
 
@@ -237,16 +245,30 @@ def test_fsapt_workflow_dataset_matches_psi4_reference(
         submit=False,
         verbose=0,
     )
+    print("Created dataset:")
+    pp({"dataset_name": dataset_name, "specification_name": specification_name})
+
     submit_meta = ds.submit(specification_names=[specification_name])
+    print("Submission metadata:")
+    pp(submit_meta.dict())
     assert submit_meta.n_inserted == 1
+    print("Assertion passed: exactly one record was inserted")
 
     records = list(ds.iterate_records(specification_names=specification_name))
+    print(f"Fetched {len(records)} record(s) from dataset")
     assert len(records) == 1
+    print("Assertion passed: dataset contains exactly one record")
+
     _, _, record = records[0]
+    print("Record summary:")
+    pp({"record_id": record.id, "status": record.status})
     assert record.status == RecordStatusEnum.waiting
+    print("Assertion passed: record is initially waiting")
 
     atomic_result = _run_fisapt_case(case)
+    print("Computed Psi4 atomic result")
     _submit_completed_result(snowflake, record.id, atomic_result)
+    print("Submitted completed result back to snowflake")
 
     original_to_qcschema_result = SinglepointRecord.to_qcschema_result
 
@@ -258,11 +280,39 @@ def test_fsapt_workflow_dataset_matches_psi4_reference(
     monkeypatch.setattr(
         SinglepointRecord, "to_qcschema_result", _patched_to_qcschema_result
     )
+    print("Monkeypatched SinglepointRecord.to_qcschema_result for target record")
 
-    results = fsapt_workflow.analyze_dataset(snowflake_client, dataset_name, specification_name)
+    results = fsapt_workflow.analyze_dataset(
+        snowflake_client, dataset_name, specification_name
+    )
+    results.to_pickle("fsapt_analysis_results.pkl")
+    print("Analyzed dataset; result table:")
+    print(results)
     assert not results.empty
+    print("Assertion passed: analysis results are not empty")
 
     for fragment_pair, expected_energies in case["expected"].items():
         row = _lookup_pair(results, fragment_pair[0], fragment_pair[1])
+        print(f"\nChecking fragment pair {fragment_pair}:")
+        pp(row.to_dict())
         for key, expected_value in expected_energies.items():
+            actual_value = row[key]
+            print(
+                f"  Verifying {key}: actual={actual_value:.12f}, "
+                f"expected={expected_value:.12f}"
+            )
             assert row[key] == pytest.approx(expected_value, abs=1.0e-5)
+            print(f"  Assertion passed for {key}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(
+        pytest.main(
+            [
+                __file__,
+                "-k",
+                "test_fsapt_workflow_dataset_matches_psi4_reference",
+                "-s",
+            ]
+        )
+    )

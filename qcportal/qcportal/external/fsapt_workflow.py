@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Union
 
-import numpy as np
 import qcelemental as qcel
 import tabulate
 
@@ -24,14 +23,13 @@ try:
     import pandas as pd
     import psi4
 except ImportError:
-    raise ImportError("Please install pandas and psi4>=1.11 to use this module")
+    raise ImportError("Please install pandas and psi4>=1.10 to use this module")
 
 if TYPE_CHECKING:
     from qcportal import PortalClient
 
 
 HARTREE_TO_KCALMOL = qcel.constants.hartree2kcalmol
-BOHR_TO_ANGSTROM = qcel.constants.bohr2angstroms
 
 REQUIRED_FRAGMENT_COLUMNS = {"id", "qcel_molecule", "fragments_a", "fragments_b"}
 
@@ -258,12 +256,6 @@ def _all_fragment_row(
     return {
         "id": entry_name,
         "qcel_molecule": mol,
-        "ZA": np.array(monomer_a.atomic_numbers),
-        "ZB": np.array(monomer_b.atomic_numbers),
-        "RA": np.array(monomer_a.geometry).reshape(-1, 3) * BOHR_TO_ANGSTROM,
-        "RB": np.array(monomer_b.geometry).reshape(-1, 3) * BOHR_TO_ANGSTROM,
-        "TQA": monomer_a.molecular_charge,
-        "TQB": monomer_b.molecular_charge,
         "Frag1": "All",
         "Frag2": "All",
         "Frag1_indices": [list(range(1, len_monomer_a + 1))],
