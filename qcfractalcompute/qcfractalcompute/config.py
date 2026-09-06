@@ -94,6 +94,18 @@ class LocalExecutorConfig(ExecutorConfig):
     max_workers: int
 
 
+def _validate_allocation_task_limit(executor_config):
+    if (
+        executor_config.max_tasks_per_allocation is not None
+        and "interchange_launch_cmd" in executor_config.extra_executor_options
+    ):
+        raise ValueError(
+            "max_tasks_per_allocation cannot be combined with "
+            "extra_executor_options.interchange_launch_cmd"
+        )
+    return executor_config
+
+
 class SlurmExecutorConfig(ExecutorConfig):
     type: Literal["slurm"] = "slurm"
 
@@ -105,7 +117,17 @@ class SlurmExecutorConfig(ExecutorConfig):
     workers_per_node: int
     max_nodes: int
 
+    max_tasks_per_allocation: int | None = Field(default=None, gt=0)
+    """Maximum tasks dispatched to one scheduler allocation before it drains. The limit is shared across all
+    workers in the allocation. ``null`` keeps the allocation available for unlimited tasks until another condition,
+    such as walltime or Parsl's ``drain_period``, stops it.
+    """
+
     scheduler_options: list[str] = []
+
+    @model_validator(mode="after")
+    def _check_allocation_task_limit(self):
+        return _validate_allocation_task_limit(self)
 
 
 class TorqueExecutorConfig(ExecutorConfig):
@@ -118,7 +140,17 @@ class TorqueExecutorConfig(ExecutorConfig):
     workers_per_node: int
     max_nodes: int
 
+    max_tasks_per_allocation: int | None = Field(default=None, gt=0)
+    """Maximum tasks dispatched to one scheduler allocation before it drains. The limit is shared across all
+    workers in the allocation. ``null`` keeps the allocation available for unlimited tasks until another condition,
+    such as walltime or Parsl's ``drain_period``, stops it.
+    """
+
     scheduler_options: list[str] = []
+
+    @model_validator(mode="after")
+    def _check_allocation_task_limit(self):
+        return _validate_allocation_task_limit(self)
 
 
 class LSFExecutorConfig(ExecutorConfig):
@@ -131,10 +163,20 @@ class LSFExecutorConfig(ExecutorConfig):
     workers_per_node: int
     max_nodes: int
 
+    max_tasks_per_allocation: int | None = Field(default=None, gt=0)
+    """Maximum tasks dispatched to one scheduler allocation before it drains. The limit is shared across all
+    workers in the allocation. ``null`` keeps the allocation available for unlimited tasks until another condition,
+    such as walltime or Parsl's ``drain_period``, stops it.
+    """
+
     request_by_nodes: bool = True
     bsub_redirection: bool = True
 
     scheduler_options: list[str] = []
+
+    @model_validator(mode="after")
+    def _check_allocation_task_limit(self):
+        return _validate_allocation_task_limit(self)
 
 
 AllExecutorTypes = Annotated[

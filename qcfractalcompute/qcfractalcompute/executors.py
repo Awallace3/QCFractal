@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import parsl
+from packaging.version import Version
 from parsl.executors import ThreadPoolExecutor, HighThroughputExecutor
+from parsl.jobs.error_handlers import windowed_error_handler
 from parsl.providers import SlurmProvider, TorqueProvider, LSFProvider
 
 from qcfractalcompute.config import (
@@ -18,6 +21,50 @@ from qcfractalcompute.config import (
 
 if TYPE_CHECKING:
     from parsl.executors.base import ParslExecutor
+
+
+SchedulerExecutorConfig = SlurmExecutorConfig | TorqueExecutorConfig | LSFExecutorConfig
+
+_MIN_ALLOCATION_LIMIT_PARSL_VERSION = Version("2026.4.13")
+_MAX_ALLOCATION_LIMIT_PARSL_VERSION = Version("2026.8.10")
+
+
+def _scheduler_htex_options(executor_config: SchedulerExecutorConfig) -> dict[str, Any]:
+    """Return a copy of user HTEX options, augmented for scheduler-specific behavior."""
+
+    options = dict(executor_config.extra_executor_options)
+    task_limit = executor_config.max_tasks_per_allocation
+    if task_limit is None:
+        return options
+
+    if "interchange_launch_cmd" in options:
+        # Config validation normally catches this. Keep this check here so callers
+        # using config-like objects cannot silently disable quota enforcement.
+        raise ValueError(
+            "max_tasks_per_allocation cannot be combined with "
+            "extra_executor_options.interchange_launch_cmd"
+        )
+
+    parsl_version = Version(parsl.__version__)
+    if not _MIN_ALLOCATION_LIMIT_PARSL_VERSION <= parsl_version <= _MAX_ALLOCATION_LIMIT_PARSL_VERSION:
+        raise RuntimeError(
+            "max_tasks_per_allocation requires a supported Parsl version in the range "
+            f"{_MIN_ALLOCATION_LIMIT_PARSL_VERSION} through {_MAX_ALLOCATION_LIMIT_PARSL_VERSION}; "
+            f"found {parsl.__version__}"
+        )
+
+    options["interchange_launch_cmd"] = [
+        sys.executable,
+        "-m",
+        "qcfractalcompute.allocation_limited_interchange",
+        "--max-tasks-per-allocation",
+        str(task_limit),
+    ]
+
+    # The stock simple_error_handler cannot detect a run of bad blocks after an
+    # intentionally-drained block has completed. Preserve an explicit override.
+    options.setdefault("block_error_handler", windowed_error_handler)
+    return options
 
 
 def build_executor(executor_label: str, executor_config: ExecutorConfig) -> ParslExecutor:
@@ -65,6 +112,8 @@ def build_executor(executor_label: str, executor_config: ExecutorConfig) -> Pars
 
     elif executor_config.type == "slurm":
         assert isinstance(executor_config, SlurmExecutorConfig)
+        htex_options = _scheduler_htex_options(executor_config)
+
         # Use a HighThroughputExecutor with a Slurm provider
         # Use blocks of size 1, so number of nodes = number of blocks
         # Pretty straightforward mapping from config to parsl config
@@ -94,11 +143,13 @@ def build_executor(executor_label: str, executor_config: ExecutorConfig) -> Pars
                 worker_init=";".join(executor_config.worker_init),
                 scheduler_options="\n".join(executor_config.scheduler_options),
             ),
-            **executor_config.extra_executor_options,
+            **htex_options,
         )
 
     elif executor_config.type == "torque":
         assert isinstance(executor_config, TorqueExecutorConfig)
+        htex_options = _scheduler_htex_options(executor_config)
+
         # Use a HighThroughputExecutor with a Torque provider
         # Use blocks of size 1, so number of nodes = number of blocks
         # Pretty straightforward mapping from config to parsl config
@@ -124,11 +175,13 @@ def build_executor(executor_label: str, executor_config: ExecutorConfig) -> Pars
                 worker_init=";".join(executor_config.worker_init),
                 scheduler_options="\n".join(executor_config.scheduler_options),
             ),
-            **executor_config.extra_executor_options,
+            **htex_options,
         )
 
     elif executor_config.type == "lsf":
         assert isinstance(executor_config, LSFExecutorConfig)
+        htex_options = _scheduler_htex_options(executor_config)
+
         # Use a HighThroughputExecutor with a LSF provider
         # Use blocks of size 1, so number of nodes = number of blocks
         # Pretty straightforward mapping from config to parsl config
@@ -164,7 +217,7 @@ def build_executor(executor_label: str, executor_config: ExecutorConfig) -> Pars
                 worker_init=";".join(executor_config.worker_init),
                 scheduler_options="\n".join(executor_config.scheduler_options),
             ),
-            **executor_config.extra_executor_options,
+            **htex_options,
         )
 
     elif executor_config.type == "custom":
