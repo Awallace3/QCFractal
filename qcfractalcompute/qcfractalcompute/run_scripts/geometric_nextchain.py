@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -8,6 +9,23 @@ import traceback
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 import geometric
+
+
+def _add_slurm_job_id(result: dict) -> None:
+    """Add the current Slurm job ID to a serialized task result, when available."""
+
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        return
+
+    if result.get("success") is True:
+        provenance = result.setdefault("provenance", {})
+        provenance["slurm_job_id"] = str(job_id)
+    elif result.get("success") is False:
+        error = result["error"]
+        error_extras = error.get("extras") or {}
+        error_extras["slurm_job_id"] = str(job_id)
+        error["extras"] = error_extras
 
 
 @contextmanager
@@ -82,9 +100,10 @@ if __name__ == "__main__":
                 "walltime": (end_time - start_time),
             },
         }
-
-        print(json.dumps(ret))
     else:
         results["error"]["error_message"] += f"\nstdout: {stdout}\n"
         results["error"]["error_message"] += f"\nstderr: {stderr}\n"
-        print(json.dumps(results))
+        ret = results
+
+    _add_slurm_job_id(ret)
+    print(json.dumps(ret))

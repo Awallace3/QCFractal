@@ -1,9 +1,28 @@
 import json
+import os
 import sys
 from contextlib import redirect_stdout, redirect_stderr
 
 import qcengine
 from qcelemental.models import QCEL_V1V2_SHIM_CODE
+
+
+def _add_slurm_job_id(result: dict) -> None:
+    """Add the current Slurm job ID to a serialized task result, when available."""
+
+    job_id = os.environ.get("SLURM_JOB_ID")
+    if not job_id:
+        return
+
+    if result.get("success") is True:
+        provenance = result.setdefault("provenance", {})
+        provenance["slurm_job_id"] = str(job_id)
+    elif result.get("success") is False:
+        error = result["error"]
+        error_extras = error.get("extras") or {}
+        error_extras["slurm_job_id"] = str(job_id)
+        error["extras"] = error_extras
+
 
 # From psi4/driver/p4util/python_helpers.py
 # https://github.com/psi4/psi4/blob/master/psi4/driver/p4util/python_helpers.py
@@ -65,4 +84,6 @@ if __name__ == "__main__":
             ret.extras["qcvars"] = {_qcvar_transitions.get(k, k): v for k, v in ret.extras["qcvars"].items()}
 
     # Still the one place that uses pydantic v1 models
-    print(json.dumps(ret.convert_v(QCEL_V1V2_SHIM_CODE).model_dump(mode="json")))
+    result_dict = ret.convert_v(QCEL_V1V2_SHIM_CODE).model_dump(mode="json")
+    _add_slurm_job_id(result_dict)
+    print(json.dumps(result_dict))
