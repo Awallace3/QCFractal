@@ -8,7 +8,7 @@ import time
 import traceback
 import uuid
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
 import parsl.executors.high_throughput.interchange
 import tabulate
@@ -27,6 +27,7 @@ from qcportal.metadata_models import TaskReturnMetadata
 from qcportal.record_models import RecordTask
 from qcportal.utils import seconds_to_hms, apply_jitter
 from . import __version__
+from . import checkpointing
 from .apps.models import AppTaskResult
 from .compress import compress_result
 from .config import FractalComputeConfig
@@ -124,6 +125,11 @@ class ComputeManager:
 
         # Mapping of task_id to record_id
         self._record_id_map: Dict[int, int] = {}
+
+        # Checkpointed tasks currently on an executor (task id -> bookkeeping), and successful
+        # checkpointed results waiting for the server to accept them (task id -> (executor, record id))
+        self._checkpoint_tasks: Dict[int, Dict[str, Any]] = {}
+        self._checkpoint_cleanup: Dict[int, Tuple[str, int]] = {}
 
         self.all_compute_tags = []
         for ex_label, ex_config in config.executors.items():
@@ -489,6 +495,7 @@ class ComputeManager:
             try:
                 return_meta = self._return_finished(results)
                 ret[attempts] = return_meta
+                self._checkpoint_after_return(return_meta)
 
                 if return_meta.success:
                     self.logger.info(f"Successfully pushed jobs from {attempts+1} updates ago")
@@ -512,6 +519,7 @@ class ComputeManager:
         deferred_return_info = self._update_deferred_tasks()
 
         results = self._acquire_complete_tasks()
+        self._triage_checkpoint_results(results)
 
         server_up = True
 
@@ -546,6 +554,7 @@ class ComputeManager:
 
                 try:
                     return_meta = self._return_finished(executor_results)
+                    self._checkpoint_after_return(return_meta)
 
                     status_rows.extend([(task_id, "sent", "") for task_id in return_meta.accepted_ids])
 
@@ -628,6 +637,8 @@ class ComputeManager:
         self.logger.info(worker_stats_str)
         self.statistics.last_update_time = time.time()
 
+        self._log_checkpoint_progress()
+
         if new_tasks and server_up:
             # What do we have for each executor?
             active_tasks = self.n_active_tasks
@@ -637,7 +648,10 @@ class ComputeManager:
 
                 # How many slots do we have?
                 # TODO - intelligently figure out the number tasks to claim over the number of slots
-                open_slots = (3 * self._get_max_workers(executor)) - active_tasks[executor_label]
+                claim_factor = 3
+                if executor_config.checkpoint is not None and executor_config.checkpoint.claim_exact:
+                    claim_factor = 1
+                open_slots = (claim_factor * self._get_max_workers(executor)) - active_tasks[executor_label]
 
                 self.logger.info(
                     f"Executor {executor_label} has {active_tasks[executor_label]} active tasks and {open_slots} open slots"
@@ -655,6 +669,7 @@ class ComputeManager:
 
                     # Add new tasks to queue
                     self.preprocess_new_tasks(new_task_info)
+                    new_task_info = self._prepare_checkpoint_tasks(executor_label, new_task_info)
                     self._submit_tasks(executor_label, new_task_info)
 
     def update(self, new_tasks) -> None:
@@ -690,6 +705,162 @@ class ComputeManager:
                 self.stop()
             else:
                 self.logger.info(f"Manager has been idle for {idle_time:.2f} seconds")
+
+    def _prepare_checkpoint_tasks(self, executor_label: str, tasks: List[RecordTask]) -> List[RecordTask]:
+        """
+        Point each checkpointed task at its record's checkpoint directory
+        """
+
+        ckpt_config = self.manager_config.executors[executor_label].checkpoint
+        if ckpt_config is None:
+            return tasks
+
+        prepared = []
+        for task in tasks:
+            if not checkpointing.wants_checkpoint(ckpt_config, task):
+                prepared.append(task)
+                continue
+
+            record_dir = ckpt_config.record_dir(task.record_id)
+            task = checkpointing.inject_checkpoint_dir(task, record_dir)
+            self._track_checkpoint_task(executor_label, task, record_dir)
+            status = checkpointing.read_status(record_dir)
+            done = checkpointing.completed_stages(status)
+            if done:
+                self.logger.info(f"Record {task.record_id} resumes from {record_dir} with {len(done)} completed stages")
+            prepared.append(task)
+
+        return prepared
+
+    def _track_checkpoint_task(self, executor_label: str, task: RecordTask, record_dir) -> None:
+        status = checkpointing.read_status(record_dir)
+        self._checkpoint_tasks[task.id] = {
+            "executor": executor_label,
+            "task": task,
+            "record_dir": record_dir,
+            "submitted_at": checkpointing.now(),
+            "completed_at_submit": len(checkpointing.completed_stages(status)),
+        }
+
+    def _triage_checkpoint_results(self, results: Dict[str, Dict[int, AppTaskResult]]) -> None:
+        """
+        Decide what each finished checkpointed task means before anything is returned to the server
+
+        Retryable failures are resubmitted and removed from ``results``; non-retryable ones are rewritten
+        into an error that names the stage. See :mod:`qcfractalcompute.checkpointing`.
+        """
+
+        table_rows = []
+        for executor_label, executor_results in results.items():
+            ckpt_config = self.manager_config.executors[executor_label].checkpoint
+            if ckpt_config is None:
+                continue
+
+            for task_id in list(executor_results.keys()):
+                info = self._checkpoint_tasks.pop(task_id, None)
+                if info is None:
+                    continue
+
+                app_result = executor_results[task_id]
+                task = info["task"]
+                record_id = task.record_id
+
+                if app_result.success:
+                    self._checkpoint_cleanup[task_id] = (executor_label, record_id)
+                    continue
+
+                result = app_result.result
+                status = checkpointing.read_status(info["record_dir"])
+                ledger = checkpointing.read_ledger(ckpt_config, record_id)
+                verdict = checkpointing.classify_failure(
+                    result.get("error") or {},
+                    status,
+                    submitted_at=info["submitted_at"],
+                    completed_at_submit=info["completed_at_submit"],
+                    stalled_before=int(ledger.get("stalled", 0)),
+                    max_stalled_attempts=ckpt_config.max_stalled_attempts,
+                )
+
+                progressed = len(checkpointing.completed_stages(status)) > info["completed_at_submit"]
+                ledger["attempts"].append(
+                    {
+                        "task_id": task_id,
+                        "manager": self.name,
+                        "submitted_at": info["submitted_at"],
+                        "ended_at": checkpointing.now(),
+                        "completed_at_submit": info["completed_at_submit"],
+                        "completed_at_end": len(checkpointing.completed_stages(status)),
+                        "verdict": verdict.action,
+                        "stage": verdict.stage,
+                        "reason": verdict.reason,
+                    }
+                )
+                if verdict.action == "retry":
+                    ledger["stalled"] = 0 if progressed else int(ledger.get("stalled", 0)) + 1
+                else:
+                    # The record leaves this manager's hands; a later reset starts a fresh count
+                    ledger["stalled"] = 0
+                try:
+                    checkpointing.write_ledger(ckpt_config, record_id, ledger)
+                except OSError as ex:
+                    self.logger.warning(f"Could not write checkpoint ledger for record {record_id}: {ex}")
+
+                table_rows.append((task_id, record_id, verdict.stage or "-", verdict.action, verdict.reason[:120]))
+
+                if verdict.action == "retry":
+                    del executor_results[task_id]
+                    self._track_checkpoint_task(executor_label, task, info["record_dir"])
+                    self._submit_tasks(executor_label, [task])
+                elif verdict.action in ("fatal", "stalled"):
+                    failed = checkpointing.fatal_result(result, verdict, record_id, info["record_dir"])
+                    executor_results[task_id] = AppTaskResult(
+                        success=False, walltime=app_result.walltime, result_compressed=compress_result(failed)
+                    )
+
+        if table_rows:
+            self.logger.info(
+                "Checkpointed task failures:\n"
+                + tabulate.tabulate(
+                    sorted(table_rows), headers=["task id", "record id", "stage", "action", "reason"]
+                )
+            )
+
+    def _checkpoint_after_return(self, return_meta: TaskReturnMetadata) -> None:
+        """
+        Remove a checkpoint directory only once the server has accepted the successful result
+        """
+
+        for task_id, reason in return_meta.rejected_info:
+            pending = self._checkpoint_cleanup.pop(task_id, None)
+            if pending is not None:
+                self.logger.warning(f"Keeping checkpoint for record {pending[1]}: result rejected ({reason})")
+
+        for task_id in return_meta.accepted_ids:
+            pending = self._checkpoint_cleanup.pop(task_id, None)
+            if pending is None:
+                continue
+            executor_label, record_id = pending
+            ckpt_config = self.manager_config.executors[executor_label].checkpoint
+            if ckpt_config.cleanup == "keep":
+                continue
+            try:
+                checkpointing.remove_record_dir(ckpt_config, record_id)
+                self.logger.info(f"Removed checkpoint for completed record {record_id}")
+            except OSError as ex:
+                self.logger.warning(f"Could not remove checkpoint for record {record_id}: {ex}")
+
+    def _log_checkpoint_progress(self) -> None:
+        if not self._checkpoint_tasks:
+            return
+        rows = []
+        for task_id, info in self._checkpoint_tasks.items():
+            status = checkpointing.read_status(info["record_dir"])
+            done, running, attempt = checkpointing.describe_progress(status)
+            rows.append((info["task"].record_id, task_id, done, running, attempt))
+        self.logger.info(
+            "Checkpointed task progress:\n"
+            + tabulate.tabulate(sorted(rows), headers=["record id", "task id", "done", "running", "attempt"])
+        )
 
     def preprocess_new_tasks(self, new_tasks: List[RecordTask]):
         """

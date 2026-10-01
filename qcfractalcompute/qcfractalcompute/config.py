@@ -9,6 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic_settings import PydanticBaseSettingsSource
 
 from qcportal.utils import seconds_to_hms, duration_to_seconds, update_nested_dict
+from .checkpointing import CheckpointConfig
 
 
 def _make_abs_path(path: str | None, base_folder: str, default_filename: str | None) -> str | None:
@@ -82,6 +83,9 @@ class ExecutorConfig(QCFComputeConfigBase):
     extra_executor_options: dict[str, Any] = {}
 
     environments: PackageEnvironmentSettings = Field(default_factory=PackageEnvironmentSettings)
+
+    checkpoint: CheckpointConfig | None = None
+    """Checkpoint/restart for long psi4 SAPT(DFT) tasks. ``null`` (the default) leaves the executor unchanged."""
 
 
 class CustomExecutorConfig(ExecutorConfig):
