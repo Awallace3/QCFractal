@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import defaultdict
 
 import pytest
 import yaml
@@ -247,6 +248,8 @@ class _FakeManager:
         self.name = "cluster-host-uuid"
         self._checkpoint_tasks = {}
         self._checkpoint_cleanup = {}
+        self._checkpoint_immediate = defaultdict(dict)
+        self._record_id_map = {}
         self.submitted = []
 
     def _submit_tasks(self, executor_label, tasks):
@@ -333,3 +336,74 @@ def test_manager_keeps_checkpoint_on_hard_failure(tmp_path):
     assert manager.submitted == []
     assert manager._checkpoint_cleanup == {}
     assert config.record_dir(301).exists()
+
+
+def _fail_hard(manager, config, task_id, record_id, attempts):
+    attempt = {
+        "started_at": time.time(),
+        "outcome": "failed",
+        "error": {"stage": "hf_dimer_scf", "type": "SCFConvergenceError", "message": "maxiter"},
+    }
+    _write_status(config.record_dir(record_id), completed=["grac_monomer_a"], attempts=[attempt] * attempts)
+    results = {"slurm": {task_id: _app_result(_failed("unknown_error", "stdout"))}}
+    manager._triage_checkpoint_results(results)
+    return results
+
+
+def test_reclaimed_fatal_record_is_not_rerun(tmp_path):
+    config = checkpointing.CheckpointConfig(root=str(tmp_path))
+    manager = _FakeManager(config)
+    manager._prepare_checkpoint_tasks("slurm", [_task(task_id=1, record_id=401)])
+    _fail_hard(manager, config, 1, 401, attempts=1)
+    manager.submitted.clear()
+
+    # The server auto-resets the record and this manager claims it again under a new task id
+    assert manager._prepare_checkpoint_tasks("slurm", [_task(task_id=2, record_id=401)]) == []
+    held = manager._checkpoint_immediate["slurm"][2].result
+    assert held["error"]["error_type"] == checkpointing.FATAL_ERROR_TYPE
+    assert "hf_dimer_scf" in held["error"]["error_message"]
+    assert manager._record_id_map[2] == 401
+    assert 2 not in manager._checkpoint_tasks
+
+
+def test_fatal_hold_releases_when_someone_else_ran_it(tmp_path):
+    config = checkpointing.CheckpointConfig(root=str(tmp_path))
+    manager = _FakeManager(config)
+    manager._prepare_checkpoint_tasks("slurm", [_task(task_id=1, record_id=402)])
+    _fail_hard(manager, config, 1, 402, attempts=1)
+
+    # A later psi4 attempt (another manager, a manual run) means the stored verdict is stale
+    _write_status(config.record_dir(402), completed=["grac_monomer_a"], attempts=[{"started_at": 1.0}] * 2)
+    assert [t.id for t in manager._prepare_checkpoint_tasks("slurm", [_task(task_id=2, record_id=402)])] == [2]
+
+
+@pytest.mark.parametrize("hold", [0.0, 1e-9])
+def test_fatal_hold_disabled_or_expired(tmp_path, hold):
+    config = checkpointing.CheckpointConfig(root=str(tmp_path), fatal_hold=hold)
+    manager = _FakeManager(config)
+    manager._prepare_checkpoint_tasks("slurm", [_task(task_id=1, record_id=403)])
+    _fail_hard(manager, config, 1, 403, attempts=1)
+    time.sleep(0.01)
+    assert [t.id for t in manager._prepare_checkpoint_tasks("slurm", [_task(task_id=2, record_id=403)])] == [2]
+
+
+def test_cli_clear_releases_a_held_record(tmp_path):
+    from qcfractalcompute import checkpoint_cli
+
+    root = tmp_path / "ckpt"
+    config = checkpointing.CheckpointConfig(root=str(root))
+    manager = _FakeManager(config)
+    manager._prepare_checkpoint_tasks("slurm", [_task(task_id=1, record_id=404)])
+    _fail_hard(manager, config, 1, 404, attempts=1)
+    assert "fatal" in checkpointing.read_ledger(config, 404)
+
+    cfg = tmp_path / "manager.yml"
+    cfg.write_text(yaml.safe_dump({
+        "cluster": "t", "server": {"fractal_uri": "http://localhost:7777/"},
+        "executors": {"slurm": {"type": "slurm", "compute_tags": ["*"], "cores_per_worker": 1,
+                                "memory_per_worker": 1.0, "max_nodes": 1, "workers_per_node": 1,
+                                "walltime": "01:00:00", "checkpoint": {"root": str(root)}}},
+    }))
+    assert checkpoint_cli.main(["--config", str(cfg), "clear", "404"]) == 0
+    assert "fatal" not in checkpointing.read_ledger(config, 404)
+    assert [t.id for t in manager._prepare_checkpoint_tasks("slurm", [_task(task_id=2, record_id=404)])] == [2]

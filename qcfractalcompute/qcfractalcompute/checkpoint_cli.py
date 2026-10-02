@@ -76,10 +76,21 @@ def main(argv=None):
     sweep.add_argument("--delete", action="store_true", help="Remove them (default: only report)")
     sweep.add_argument("--username", default=None, help="Server user with read access (default: the manager's)")
     sweep.add_argument("--password", default=None)
+    clear = sub.add_parser("clear", help="Let records run again before checkpoint.fatal_hold expires")
+    clear.add_argument("record_ids", nargs="+", type=int)
     args = parser.parse_args(argv)
 
     config = read_configuration([args.config])
     executors = _checkpoint_executors(config, args.executor)
+    if args.command == "clear":
+        for record_id in args.record_ids:
+            for ckpt_config in executors.values():
+                ledger = checkpointing.read_ledger(ckpt_config, record_id)
+                if ledger.pop("fatal", None) is not None:
+                    checkpointing.write_ledger(ckpt_config, record_id, ledger)
+                    print(f"Released record {record_id}")
+        return 0
+
     rows = _record_rows(executors)
     headers = ["executor", "record id", "psi4 state", "done", "next stage", "attempts", "updated"]
 

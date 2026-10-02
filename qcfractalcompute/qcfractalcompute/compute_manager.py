@@ -130,6 +130,8 @@ class ComputeManager:
         # checkpointed results waiting for the server to accept them (task id -> (executor, record id))
         self._checkpoint_tasks: Dict[int, Dict[str, Any]] = {}
         self._checkpoint_cleanup: Dict[int, Tuple[str, int]] = {}
+        # Results produced without running anything (a held non-retryable failure), returned on the next update
+        self._checkpoint_immediate: Dict[str, Dict[int, AppTaskResult]] = defaultdict(dict)
 
         self.all_compute_tags = []
         for ex_label, ex_config in config.executors.items():
@@ -519,6 +521,9 @@ class ComputeManager:
         deferred_return_info = self._update_deferred_tasks()
 
         results = self._acquire_complete_tasks()
+        for executor_label, immediate in self._checkpoint_immediate.items():
+            results.setdefault(executor_label, {}).update(immediate)
+        self._checkpoint_immediate = defaultdict(dict)
         self._triage_checkpoint_results(results)
 
         server_up = True
@@ -722,9 +727,21 @@ class ComputeManager:
                 continue
 
             record_dir = ckpt_config.record_dir(task.record_id)
+            status = checkpointing.read_status(record_dir)
+            held = checkpointing.held_fatal(ckpt_config, checkpointing.read_ledger(ckpt_config, task.record_id), status)
+            if held is not None:
+                self.logger.warning(
+                    f"Record {task.record_id} failed non-retryably {held['error'].get('extras', {}).get('checkpoint_stage')}"
+                    f" within checkpoint.fatal_hold; returning that failure again instead of rerunning it"
+                )
+                self._record_id_map[task.id] = task.record_id
+                self._checkpoint_immediate[executor_label][task.id] = AppTaskResult(
+                    success=False, walltime=0.0, result_compressed=compress_result(held)
+                )
+                continue
+
             task = checkpointing.inject_checkpoint_dir(task, record_dir)
             self._track_checkpoint_task(executor_label, task, record_dir)
-            status = checkpointing.read_status(record_dir)
             done = checkpointing.completed_stages(status)
             if done:
                 self.logger.info(f"Record {task.record_id} resumes from {record_dir} with {len(done)} completed stages")
@@ -795,6 +812,12 @@ class ComputeManager:
                         "reason": verdict.reason,
                     }
                 )
+                failed = None
+                if verdict.action in ("fatal", "stalled"):
+                    failed = checkpointing.fatal_result(result, verdict, record_id, info["record_dir"])
+                    checkpointing.record_fatal(ledger, failed, verdict, status)
+                else:
+                    ledger.pop("fatal", None)
                 if verdict.action == "retry":
                     ledger["stalled"] = 0 if progressed else int(ledger.get("stalled", 0)) + 1
                 else:
@@ -811,8 +834,7 @@ class ComputeManager:
                     del executor_results[task_id]
                     self._track_checkpoint_task(executor_label, task, info["record_dir"])
                     self._submit_tasks(executor_label, [task])
-                elif verdict.action in ("fatal", "stalled"):
-                    failed = checkpointing.fatal_result(result, verdict, record_id, info["record_dir"])
+                elif failed is not None:
                     executor_results[task_id] = AppTaskResult(
                         success=False, walltime=app_result.walltime, result_compressed=compress_result(failed)
                     )

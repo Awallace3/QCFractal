@@ -109,6 +109,12 @@ class CheckpointConfig(BaseModel):
     cleanup: Literal["delete", "keep"] = "delete"
     """What to do with the checkpoint directory after the server accepts a successful result."""
 
+    fatal_hold: float = Field(21600.0, ge=0)
+    """Seconds after a non-retryable failure during which a reclaimed record is failed again at once instead of
+    rerun. The server's auto-reset otherwise sends it straight back, and the failing stage reruns each time.
+    Only applies while psi4's status file shows no attempt since the failure. ``0`` disables;
+    ``qcfractal-compute-checkpoints clear`` releases a record early."""
+
     def root_path(self) -> Path:
         return Path(os.path.expanduser(os.path.expandvars(self.root)))
 
@@ -154,6 +160,41 @@ def read_ledger(config: CheckpointConfig, record_id: int) -> dict[str, Any]:
     if not isinstance(ledger, dict) or ledger.get("schema_version") != LEDGER_SCHEMA_VERSION:
         ledger = {"schema_version": LEDGER_SCHEMA_VERSION, "record_id": record_id, "stalled": 0, "attempts": []}
     return ledger
+
+
+def psi4_attempts(status: dict[str, Any] | None) -> int:
+    attempts = (status or {}).get("attempts")
+    return len(attempts) if isinstance(attempts, list) else 0
+
+
+def record_fatal(ledger: dict[str, Any], failed: dict[str, Any], verdict: "Verdict", status: dict[str, Any] | None) -> None:
+    """Remember a non-retryable failure so a prompt reclaim can be answered without rerunning it."""
+
+    error = dict(failed.get("error") or {})
+    message = str(error.get("error_message", ""))
+    if len(message) > 20000:
+        error["error_message"] = message[:4000] + "\n...\n" + message[-16000:]
+    ledger["fatal"] = {
+        "at": now(),
+        "psi4_attempts": psi4_attempts(status),
+        "verdict": verdict.action,
+        "stage": verdict.stage,
+        "result": {"success": False, "error": error},
+    }
+
+
+def held_fatal(config: CheckpointConfig, ledger: dict[str, Any], status: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The stored failure to return instead of rerunning, or None when the record should run."""
+
+    fatal = ledger.get("fatal")
+    if not isinstance(fatal, dict) or config.fatal_hold <= 0:
+        return None
+    if now() - float(fatal.get("at", 0.0)) > config.fatal_hold:
+        return None
+    # Someone (another manager, a manual run) has tried it since: trust their outcome, not ours
+    if psi4_attempts(status) != fatal.get("psi4_attempts"):
+        return None
+    return fatal.get("result")
 
 
 def write_ledger(config: CheckpointConfig, record_id: int, ledger: dict[str, Any]) -> None:
